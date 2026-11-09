@@ -2,6 +2,7 @@ import { ArgumentsHost, Catch, ExceptionFilter, HttpException } from "@nestjs/co
 import type { Response } from "express";
 import { DomainError, InvalidMoneyError } from "../domain/errors";
 import { log } from "./logger";
+import { metrics } from "./metrics";
 
 /**
  * Mapeamento HTTP consistente (ver ARCHITECTURE.md):
@@ -16,11 +17,13 @@ const STATUS_BY_CODE: Record<string, number> = {
   REFERENCE_REQUIRED: 400,
   REFERENCE_NOT_ALLOWED: 400,
   MISSING_IDEMPOTENCY_KEY: 400,
+  INVALID_PAYLOAD: 400,
+  INVALID_CURSOR: 400,
+  INVALID_LIMIT: 400,
   WALLET_NOT_FOUND: 404,
   NOT_FOUND: 404,
   IDEMPOTENCY_CONFLICT: 409,
   WALLET_ALREADY_EXISTS: 409,
-  NOT_IMPLEMENTED: 501,
 };
 
 @Catch()
@@ -35,7 +38,10 @@ export class AppExceptionFilter implements ExceptionFilter {
       res.status(STATUS_BY_CODE[err.code] ?? 422).json({ error: err.code, message: err.message });
       return;
     }
-    log.error("unexpected error", { error: (err as Error)?.message });
+    const code = (err as { code?: string })?.code;
+    if (code === "55P03" || code === "40P01") metrics.inc("lock_conflicts_total", { code });
+    log.error("unexpected error", { error: (err as Error)?.message, code });
+    res.setHeader("Retry-After", "1");
     res.status(503).json({ error: "TRANSIENT_FAILURE", message: "Tente novamente" });
   }
 }

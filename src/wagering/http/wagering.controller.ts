@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Headers, Param, Post, Res } from "@nestjs/common";
+import { UseGuards, Body, Controller, Get, Headers, Param, Post, Res } from "@nestjs/common";
 import { EntityManager } from "@mikro-orm/postgresql";
 import { randomUUIDv7 } from "bun";
 import type { Response } from "express";
+import { ProviderAuthGuard } from "../../shared/auth/provider-auth.guard";
 import { DomainError } from "../../shared/domain/errors";
 import { SubmitWagerTransactionUseCase, type SubmitWagerInput } from "../application/submit-wager-transaction.use-case";
 import { WagerTransactionStatus } from "../domain/wager-transaction";
@@ -18,6 +19,7 @@ const view = (r: WagerTransactionRow) => ({
   failureCode: r.failure_code ?? undefined,
 });
 
+@UseGuards(ProviderAuthGuard)
 @Controller()
 export class WageringController {
   private readonly transactions = new WagerTransactionRepository();

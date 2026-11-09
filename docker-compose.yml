@@ -6,6 +6,8 @@ services:
       POSTGRES_PASSWORD: wagering
       POSTGRES_DB: wagering
     ports: ["5432:5432"]
+    volumes:
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-test-db.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wagering"]
       interval: 3s
@@ -18,6 +20,20 @@ services:
     ports: ["4566:4566"]
     volumes:
       - ./localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wagering-events.fifo"]
+      interval: 3s
+      retries: 30
+
+  # Roda as migrations UMA vez antes das réplicas (evita corrida entre instâncias).
+  migrate:
+    build: .
+    env_file: .env.example
+    environment:
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+    command: ["bun", "run", "migration:up"]
+    depends_on:
+      postgres: { condition: service_healthy }
 
   # Três instâncias da aplicação para provar a correção com múltiplos processos.
   app:
@@ -26,8 +42,10 @@ services:
     environment:
       DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
       AWS_ENDPOINT: http://localstack:4566
+      RUN_MIGRATIONS: "false"
+    ports: ["3000-3002:3000"]
     depends_on:
-      postgres: { condition: service_healthy }
-      localstack: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+      localstack: { condition: service_healthy }
     deploy:
       replicas: 3

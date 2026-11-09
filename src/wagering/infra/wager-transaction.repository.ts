@@ -25,6 +25,8 @@ export interface WagerTransactionRow {
   status: WagerTransactionStatus;
   failure_code: FailureCode | null;
   result_balance: string | null;
+  attempts: number;
+  next_attempt_at: Date | null;
   created_at: Date;
   processed_at: Date | null;
 }
@@ -95,6 +97,58 @@ export class WagerTransactionRepository {
     const rows = await em.execute<WagerTransactionRow[]>(
       `select * from wager_transactions where provider_id = ? and external_transaction_id = ?`,
       [providerId, externalId],
+    );
+    return rows[0] ?? null;
+  }
+
+  /** Referência por (providerId, externalTransactionId) já como domínio. */
+  async findReference(em: EntityManager, providerId: string, externalId: string): Promise<WagerTransaction | undefined> {
+    const row = await this.findByExternal(em, providerId, externalId);
+    return row ? rowToTransaction(row) : undefined;
+  }
+
+  /** A referência já foi revertida (REFUND ou ROLLBACK PROCESSED)? Índice único parcial garante no banco. */
+  async isAlreadyReversed(em: EntityManager, referenceTransactionId: string): Promise<boolean> {
+    const rows = await em.execute<{ n: string }[]>(
+      `select count(*) as n from wager_transactions
+        where reference_transaction_id = ? and kind in ('REFUND','ROLLBACK') and status = 'PROCESSED'`,
+      [referenceTransactionId],
+    );
+    return Number(rows[0]?.n ?? 0) > 0;
+  }
+
+  /** Agenda nova tentativa de resolução da referência (worker de PENDING_REFERENCE). */
+  async schedulePendingReference(em: EntityManager, id: string, attempts: number, nextAttemptAt: Date): Promise<void> {
+    await em.execute(`update wager_transactions set attempts = ?, next_attempt_at = ? where id = ?`, [attempts, nextAttemptAt, id]);
+  }
+
+  /** Quando uma referência chega, antecipa as dependentes que esperavam por ela (latência menor). */
+  async wakeDependents(em: EntityManager, providerId: string, externalTransactionId: string): Promise<void> {
+    await em.execute(
+      `update wager_transactions set next_attempt_at = now()
+        where status = 'PENDING_REFERENCE' and provider_id = ? and reference_external_transaction_id = ?`,
+      [providerId, externalTransactionId],
+    );
+  }
+
+  /** Ids de PENDING_REFERENCE vencidas (sem lock: o lock real é feito por item, depois da wallet). */
+  async findDuePendingReference(em: EntityManager, limit: number): Promise<{ id: string; wallet_id: string }[]> {
+    return em.execute<{ id: string; wallet_id: string }[]>(
+      `select id, wallet_id from wager_transactions
+        where status = 'PENDING_REFERENCE' and next_attempt_at <= now()
+        order by next_attempt_at limit ?`,
+      [limit],
+    );
+  }
+
+  /**
+   * Lock da linha PENDING_REFERENCE (chamado DEPOIS do lock da wallet, mesma ordem do caso de uso
+   * para não gerar deadlock). SKIP LOCKED: se outra instância já está nela, pula.
+   */
+  async lockPendingReference(em: EntityManager, id: string): Promise<WagerTransactionRow | null> {
+    const rows = await em.execute<WagerTransactionRow[]>(
+      `select * from wager_transactions where id = ? and status = 'PENDING_REFERENCE' for update skip locked`,
+      [id],
     );
     return rows[0] ?? null;
   }

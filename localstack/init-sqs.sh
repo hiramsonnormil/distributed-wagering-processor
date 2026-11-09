@@ -7,3 +7,6 @@ DLQ_ARN=$(awslocal sqs get-queue-attributes \
   --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
 awslocal sqs create-queue --queue-name wager-transactions.fifo \
   --attributes "{\"FifoQueue\":\"true\",\"ContentBasedDeduplication\":\"false\",\"VisibilityTimeout\":\"30\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"5\\\"}\"}"
+# Fila de eventos de integração publicados pela outbox.
+awslocal sqs create-queue --queue-name wagering-events.fifo \
+  --attributes FifoQueue=true,ContentBasedDeduplication=false

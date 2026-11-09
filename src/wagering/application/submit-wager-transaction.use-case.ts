@@ -1,23 +1,21 @@
 import { Injectable } from "@nestjs/common";
 import { EntityManager } from "@mikro-orm/postgresql";
 import { randomUUIDv7 } from "bun";
-import { DomainError, InsufficientFundsError } from "../../shared/domain/errors";
+import { DomainError } from "../../shared/domain/errors";
 import { Money, type MoneyProps } from "../../shared/domain/money";
 import { log } from "../../shared/infra/logger";
 import { metrics } from "../../shared/infra/metrics";
-import {
-  WagerTransactionProcessed,
-  WagerTransactionRejected,
-  WalletBalanceChanged,
-  type EventContext,
-} from "../../messaging/domain/events";
+import type { EventContext } from "../../messaging/domain/events";
 import type { IntegrationEvent } from "../../messaging/domain/integration-event";
+import { InboxRepository } from "../../messaging/infra/inbox.repository";
 import { enqueueOutbox } from "../../messaging/infra/outbox.writer";
 import { WalletRepository } from "../../wallet/infra/wallet.repository";
-import { FailureCode } from "../domain/failure-code";
+import type { FailureCode } from "../domain/failure-code";
 import { payloadHash } from "../domain/payload-hash";
+import { PENDING_REFERENCE_POLICY } from "../domain/reference-policy";
 import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from "../domain/wager-transaction";
 import { WagerTransactionRepository } from "../infra/wager-transaction.repository";
+import { WagerProcessor } from "./wager-processor";
 
 export interface SubmitWagerInput {
   idempotencyKey: string;
@@ -31,6 +29,12 @@ export interface SubmitWagerInput {
   money: MoneyProps;
   referenceExternalTransactionId?: string;
   correlationId: string;
+}
+
+/** Quando a entrada vem da fila: registro de inbox na MESMA transação. */
+export interface InboxContext {
+  consumerName: string;
+  messageId: string;
 }
 
 export interface SubmitWagerResult {
@@ -51,6 +55,11 @@ export class WalletNotFoundError extends DomainError {
     super("WALLET_NOT_FOUND", "Wallet não encontrada");
   }
 }
+export class InvalidPayloadError extends DomainError {
+  constructor(message: string) {
+    super("INVALID_PAYLOAD", message);
+  }
+}
 
 const SUBMITTABLE = new Set<string>([
   WagerTransactionKind.Bet,
@@ -60,35 +69,56 @@ const SUBMITTABLE = new Set<string>([
   WagerTransactionKind.Rollback,
 ]);
 
+const REQUIRED_STRINGS = ["providerId", "externalTransactionId", "playerId", "walletId", "roundId", "gameId"] as const;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Caso de uso ÚNICO, usado pela API HTTP e pelo consumidor SQS.
  *
  * Fluxo (tudo numa transação SQL):
- *  1. lock pessimista da wallet (SELECT ... FOR UPDATE);
- *  2. INSERT da transação com ON CONFLICT → detecta replay/conflito de forma persistente;
- *  3. aplica a regra de negócio no domínio (Wallet.debit/credit);
- *  4. grava saldo, ledger, resultado e eventos na outbox;
- *  5. commit. Só depois disso a resposta sai / o ack acontece.
+ *  1. lock pessimista da wallet (SELECT ... FOR UPDATE) — unidade de concorrência;
+ *  2. (SQS) INSERT na inbox (consumer_name, message_id) ON CONFLICT → redelivery vira replay;
+ *  3. INSERT da transação com ON CONFLICT → detecta replay/conflito de forma persistente;
+ *  4. WagerProcessor aplica a regra de negócio (saldo, ledger) ou deixa em PENDING_REFERENCE;
+ *  5. grava resultado + eventos na outbox;
+ *  6. commit. Só depois disso a resposta sai / o ack acontece.
  */
 @Injectable()
 export class SubmitWagerTransactionUseCase {
   private readonly wallets = new WalletRepository();
   private readonly transactions = new WagerTransactionRepository();
+  private readonly inbox = new InboxRepository();
+  private readonly processor = new WagerProcessor();
 
   constructor(private readonly em: EntityManager) {}
 
-  async execute(input: SubmitWagerInput): Promise<SubmitWagerResult> {
+  async execute(input: SubmitWagerInput, inbox?: InboxContext): Promise<SubmitWagerResult> {
+    validateShape(input);
     if (!SUBMITTABLE.has(input.kind)) {
       throw new DomainError("INVALID_KIND", `kind inválido: ${input.kind}`); // OPENING é interno
     }
     const money = Money.from(input.money); // valida antes de abrir transação
     const hash = payloadHash({ ...input, money: money.toJSON() });
-    const now = new Date();
-    const ctx: EventContext = { correlationId: input.correlationId, now };
+    const started = performance.now();
 
-    return this.em.fork().transactional(async (em) => {
+    const result = await this.em.fork().transactional(async (em) => {
+      await em.execute(`set local lock_timeout = '${Number(process.env.LOCK_TIMEOUT_MS ?? 5000)}ms'`);
+      const now = new Date();
+      const ctx: EventContext = { correlationId: input.correlationId, causationId: inbox?.messageId, now };
+
+      const lockStart = performance.now();
       const wallet = await this.wallets.lockById(em, input.walletId);
+      metrics.observe("wallet_lock_wait_ms", performance.now() - lockStart);
       if (!wallet) throw new WalletNotFoundError();
+
+      if (inbox) {
+        const fresh = await this.inbox.tryReceive(em, inbox.consumerName, inbox.messageId, hash, now);
+        if (!fresh) {
+          // Redelivery: o efeito já foi commitado por outra entrega da mesma mensagem.
+          metrics.inc("duplicates_detected_total", { source: "inbox" });
+          return this.replay(em, input, hash);
+        }
+      }
 
       const tx = WagerTransaction.create({
         id: randomUUIDv7(),
@@ -107,52 +137,39 @@ export class SubmitWagerTransactionUseCase {
       });
 
       const inserted = await this.transactions.tryInsert(em, tx);
-      if (!inserted) return this.replay(em, input, hash);
+      if (!inserted) {
+        const replay = await this.replay(em, input, hash);
+        if (inbox) await this.inbox.markProcessed(em, inbox.consumerName, inbox.messageId, now);
+        return replay;
+      }
 
       const events: IntegrationEvent<unknown>[] = [];
-      const reject = (code: FailureCode) => {
-        tx.reject(code);
-        events.push(WagerTransactionRejected.from(tx, ctx));
-      };
+      const outcome = await this.processor.process(em, tx, wallet, ctx, events);
 
-      if (wallet.playerId !== input.playerId) {
-        reject(FailureCode.WalletOwnershipMismatch);
-      } else if (money.currency !== wallet.currency) {
-        reject(FailureCode.CurrencyMismatch);
-      } else if (tx.requiresReference()) {
-        // TODO(candidato): resolver a referência por (providerId, referenceExternalTransactionId),
-        // validar provider/player/wallet/moeda/rodada, kind permitido, valor igual, reversão única,
-        // e saldo não negativo (REVERSAL_WOULD_OVERDRAW). Se não existir: markPendingReference()
-        // + evento WagerTransactionPendingReference + next_attempt_at para o worker.
-        throw new DomainError("NOT_IMPLEMENTED", "REFUND/ROLLBACK ainda não implementados");
-      } else if (tx.affectsBalance()) {
-        const versionBefore = wallet.version;
-        try {
-          const entry =
-            tx.kind === WagerTransactionKind.Bet ? wallet.debit(money, tx.id, now) : wallet.credit(money, tx.id, now);
-          await this.wallets.updateBalance(em, wallet, versionBefore);
-          await this.wallets.insertLedgerEntry(em, entry);
-          tx.markProcessed(undefined, now);
-          events.push(WagerTransactionProcessed.from(tx, ctx), WalletBalanceChanged.from(wallet, entry, ctx));
-        } catch (err) {
-          if (!(err instanceof InsufficientFundsError)) throw err;
-          reject(FailureCode.InsufficientFunds);
-        }
-      } else {
-        // LOSS: registra o resultado sem mover saldo e sem ledger.
-        tx.markProcessed(undefined, now);
-        events.push(WagerTransactionProcessed.from(tx, ctx));
+      if (outcome === "WAITING_REFERENCE") {
+        // Referência ainda não chegou: persiste e agenda o worker (seção 7.1).
+        tx.markPendingReference();
+        events.push(WagerProcessor.pendingEvent(tx, ctx));
+        await this.transactions.schedulePendingReference(em, tx.id, 0, PENDING_REFERENCE_POLICY.nextAttemptAt(0, now));
       }
 
       await this.transactions.saveOutcome(em, tx, wallet.balance);
+      if (tx.status === WagerTransactionStatus.Processed) {
+        await this.transactions.wakeDependents(em, tx.providerId, tx.externalTransactionId);
+      }
       await enqueueOutbox(em, events);
+      if (inbox) await this.inbox.markProcessed(em, inbox.consumerName, inbox.messageId, now);
+
       metrics.inc("wager_transactions_total", { status: tx.status, kind: tx.kind });
       log.info("wager transaction applied", {
         correlationId: input.correlationId,
+        messageId: inbox?.messageId,
         transactionId: tx.id,
         walletId: wallet.id,
         providerId: tx.providerId,
+        kind: tx.kind,
         status: tx.status,
+        failureCode: tx.failureCode,
       });
 
       return {
@@ -161,8 +178,11 @@ export class SubmitWagerTransactionUseCase {
         balance: wallet.balance.toJSON(),
         failureCode: tx.failureCode,
         idempotentReplay: false,
-      };
+      } satisfies SubmitWagerResult;
     });
+
+    metrics.observe("wager_processing_ms", performance.now() - started);
+    return result;
   }
 
   /** Mesma key + mesmo payload → resultado original. Payload diferente → conflito. */
@@ -174,13 +194,29 @@ export class SubmitWagerTransactionUseCase {
       metrics.inc("idempotency_conflicts_total");
       throw new IdempotencyConflictError();
     }
-    metrics.inc("duplicates_detected_total");
+    metrics.inc("duplicates_detected_total", { source: "idempotency" });
     return {
       transactionId: existing.id,
       status: existing.status,
-      balance: { amount: Money.fromPersistence(existing.result_balance ?? "0", existing.currency).toString(), currency: existing.currency },
+      // Saldo observado no momento em que a transação foi aplicada (regra 7.7).
+      balance: Money.fromPersistence(existing.result_balance ?? "0", existing.currency).toJSON(),
       failureCode: existing.failure_code ?? undefined,
       idempotentReplay: true,
     };
   }
+}
+
+function validateShape(input: SubmitWagerInput): void {
+  for (const field of REQUIRED_STRINGS) {
+    const v = (input as unknown as Record<string, unknown>)[field];
+    if (typeof v !== "string" || v.trim() === "" || v.length > 200) {
+      throw new InvalidPayloadError(`Campo obrigatório inválido: ${field}`);
+    }
+  }
+  if (!UUID.test(input.walletId)) throw new InvalidPayloadError("walletId deve ser UUID");
+  if (!UUID.test(input.playerId)) throw new InvalidPayloadError("playerId deve ser UUID");
+  if (input.referenceExternalTransactionId !== undefined && typeof input.referenceExternalTransactionId !== "string") {
+    throw new InvalidPayloadError("referenceExternalTransactionId deve ser string");
+  }
+  if (!input.money || typeof input.money !== "object") throw new InvalidPayloadError("money é obrigatório");
 }

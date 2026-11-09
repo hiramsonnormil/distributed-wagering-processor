@@ -6,6 +6,7 @@ import { WagerQueueConsumer } from "./messaging/infra/wager-queue.consumer";
 import { PendingReferenceWorker } from "./wagering/application/pending-reference.worker";
 import { SubmitWagerTransactionUseCase } from "./wagering/application/submit-wager-transaction.use-case";
 import { WageringController } from "./wagering/http/wagering.controller";
+import { WalletQueries } from "./wallet/application/wallet-queries";
 import { CreateWalletUseCase } from "./wallet/application/create-wallet.use-case";
 import { WalletController } from "./wallet/http/wallet.controller";
 
@@ -14,6 +15,7 @@ import { WalletController } from "./wallet/http/wallet.controller";
   controllers: [HealthController, WalletController, WageringController],
   providers: [
     CreateWalletUseCase,
+    WalletQueries,
     SubmitWagerTransactionUseCase,
     WagerQueueConsumer,
     OutboxPublisher,

@@ -31,6 +31,12 @@ export class CreateWalletUseCase {
   constructor(private readonly em: EntityManager) {}
 
   async execute(input: CreateWalletInput): Promise<Wallet> {
+    if (typeof input.playerId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.playerId)) {
+      throw new DomainError("INVALID_PAYLOAD", "playerId deve ser UUID");
+    }
+    if (!input.initialBalance || typeof input.initialBalance !== "object") {
+      throw new DomainError("INVALID_PAYLOAD", "initialBalance é obrigatório");
+    }
     const initialBalance = Money.from(input.initialBalance);
     const now = new Date();
     const walletId = randomUUIDv7();
